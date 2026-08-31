@@ -74,7 +74,8 @@ class TestE2E(unittest.TestCase):
         self.assertEqual(kinds, ["prefill@8000", "decode"])
         self.assertTrue(all(p.get("sha_equal") for p in summary["ambient"]["pairs"]))
         # attribution fields present
-        self.assertEqual(summary["env"]["tool_version"], "0.1.0")
+        from stack_bench import TOOL_VERSION as _TV
+        self.assertEqual(summary["env"]["tool_version"], _TV)
         self.assertEqual(summary["server"]["n_ctx"], 32768)
         self.assertEqual(summary["schema_version"], 1)
         # per-rep distinct prompt texts (F2): battery rows carry distinct
