@@ -1,5 +1,20 @@
 # stack-bench
 
+**One-command honest local-inference benchmark for llama-server.** Measures prefill and decode throughput against any llama-server-compatible endpoint with true-token prompt sizing, ambient-noise controls, and speculative-decoding state disclosure. Zero dependencies, Python 3.10+, MIT license.
+
+<!-- Agent metadata
+tool: stack-bench
+version: 0.1.1
+language: python
+dependencies: none (stdlib only)
+license: MIT
+compatibility: llama-server / any OpenAI-completion-compatible endpoint with /tokenize
+measures: prefill_tps, decode_tps, ambient_noise, spec_dec_state
+output: JSON (summary + rows.jsonl)
+tests: 19, offline, no network required
+-->
+
+
 One-command honest local-inference battery: measures prefill and decode
 throughput against any llama-server-compatible endpoint, with true-token
 prompt sizing and an ambient-noise control, emitting machine-readable JSON.
