@@ -1,0 +1,81 @@
+{
+ "schema_version": 1,
+ "name": "production-server-parity",
+ "env": {
+  "date": "2026-08-30T18:51:17Z",
+  "tool_version": "0.1.0",
+  "python_version": "3.12.3"
+ },
+ "server": {
+  "model_path": "<redacted>",
+  "n_ctx": null,
+  "n_batch": null,
+  "n_ubatch": null,
+  "n_gpu_layers": null,
+  "build": "b3-46aa138f3",
+  "commit": null,
+  "default_generation_settings": true
+ },
+ "prefill": {
+  "rows": 4,
+  "errors": 0,
+  "timings_missing_rows": 0,
+  "word_approx_rows": 0,
+  "by_measured_prompt_n": {
+   "16000": {
+    "mean_tps": 213.4,
+    "min": 211.9,
+    "max": 214.9,
+    "n": 2
+   },
+   "8000": {
+    "mean_tps": 223.9,
+    "min": 219.5,
+    "max": 228.4,
+    "n": 2
+   }
+  },
+  "wall_s": 231.3
+ },
+ "decode": {
+  "rows": 2,
+  "errors": 0,
+  "timings_missing_rows": 0,
+  "word_approx_rows": 0,
+  "early_eos_rows": 0,
+  "decode_tps": {
+   "mean_tps": 17.6,
+   "min": 12.8,
+   "max": 22.3,
+   "n": 2
+  },
+  "wall_s": 34.9
+ },
+ "ambient": {
+  "pairs": [
+   {
+    "kind": "prefill@8000",
+    "sha_equal": true,
+    "prompt_tps_a": 228.0,
+    "prompt_tps_b": 232.6,
+    "tps_delta": 4.6
+   },
+   {
+    "kind": "prefill@16000",
+    "sha_equal": true,
+    "prompt_tps_a": 202.7,
+    "prompt_tps_b": 205.3,
+    "tps_delta": 2.6
+   },
+   {
+    "kind": "decode",
+    "sha_equal": false,
+    "predicted_tps_a": 7.5,
+    "predicted_tps_b": 10.9,
+    "tps_delta": 3.4
+   }
+  ],
+  "wall_s": 286.0
+ },
+ "wall_s_total": 552.3
+}
