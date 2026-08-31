@@ -1,0 +1,133 @@
+{
+ "schema_version": 1,
+ "name": "hq64k-fork-v2",
+ "env": {
+  "url": "http://127.0.0.1:46415",
+  "date": "2026-08-31T02:22:34Z",
+  "argv": [
+   "/home/simon/exp/lab1/stack_bench.py",
+   "--url",
+   "http://127.0.0.1:46415",
+   "--name",
+   "hq64k-fork-v2",
+   "--targets",
+   "8000,16000,32000,65000,131000",
+   "--reps",
+   "2",
+   "--out",
+   "/home/simon/exp/lab1/hq64k",
+   "--timeout-completion",
+   "3600"
+  ],
+  "tool_version": "0.1.1",
+  "python_version": "3.12.3"
+ },
+ "server": {
+  "model_path": "/home/simon/.cache/huggingface/hub/models--unsloth--Qwen3.8-27B-GGUF/snapshots/fdd03b8bbd279c1694563650e79d85a2373d9934/Qwen3.8-27B-UD-Q4_K_XL.gguf",
+  "spec_dec": "NOT EXPOSED by this server build \u2014 decode t/s is END-TO-END (speculative-decoding gains included if the server runs a draft model; not isolated)",
+  "n_ctx": null,
+  "n_batch": null,
+  "n_ubatch": null,
+  "n_gpu_layers": null,
+  "build": "b10639-ad914eb6",
+  "commit": null,
+  "default_generation_settings": true
+ },
+ "prefill": {
+  "rows": 10,
+  "errors": 2,
+  "timings_missing_rows": 0,
+  "word_approx_rows": 0,
+  "by_measured_prompt_n": {
+   "16000": {
+    "mean_tps": 211.3,
+    "min": 211.3,
+    "max": 211.3,
+    "n": 2
+   },
+   "32000": {
+    "mean_tps": 196.9,
+    "min": 196.7,
+    "max": 197.1,
+    "n": 2
+   },
+   "64000": {
+    "mean_tps": 170.6,
+    "min": 169.3,
+    "max": 171.8,
+    "n": 2
+   },
+   "8000": {
+    "mean_tps": 218.2,
+    "min": 217.8,
+    "max": 218.6,
+    "n": 2
+   }
+  },
+  "wall_s": 1582.1
+ },
+ "decode": {
+  "rows": 2,
+  "errors": 0,
+  "timings_missing_rows": 0,
+  "word_approx_rows": 0,
+  "early_eos_rows": 0,
+  "decode_tps": {
+   "mean_tps": 11.3,
+   "min": 11.3,
+   "max": 11.3,
+   "n": 2
+  },
+  "wall_s": 41.7
+ },
+ "ambient": {
+  "pairs": [
+   {
+    "kind": "prefill@8000",
+    "sha_equal": false,
+    "prompt_tps_a": 219.5,
+    "prompt_tps_b": 219.4,
+    "tps_delta": 0.1
+   },
+   {
+    "kind": "prefill@16000",
+    "sha_equal": false,
+    "prompt_tps_a": 211.1,
+    "prompt_tps_b": 211.0,
+    "tps_delta": 0.1
+   },
+   {
+    "kind": "prefill@32000",
+    "sha_equal": true,
+    "prompt_tps_a": 196.9,
+    "prompt_tps_b": 196.8,
+    "tps_delta": 0.1
+   },
+   {
+    "kind": "prefill@65000",
+    "sha_equal": false,
+    "prompt_tps_a": 172.0,
+    "prompt_tps_b": 171.9,
+    "tps_delta": 0.1
+   },
+   {
+    "kind": "prefill@131000",
+    "sha_equal": null,
+    "error": {
+     "status": 400,
+     "body": "{\"error\":{\"code\":400,\"message\":\"request (131080 tokens) exceeds the available context size (131072 tokens), try increasing it\",\"type\":\"exceed_context_size_error\",\"n_prompt_tokens\":131080,\"n_ctx\":131072}}",
+     "transport_error": null
+    }
+   },
+   {
+    "kind": "decode",
+    "sha_equal": false,
+    "predicted_tps_a": 11.3,
+    "predicted_tps_b": 11.3,
+    "tps_delta": 0.0
+   }
+  ],
+  "wall_s": 1483.0
+ },
+ "wall_s_total": 3106.8
+}
