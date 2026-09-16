@@ -123,7 +123,21 @@ live (mean 17.6 t/s, range 12.8-22.3), and the ambient pair minutes later
 read 7.5-10.9 t/s with hash-unequal outputs — a ~2.4x spread the tool
 caught and we report verbatim rather than smooth away; treat decode
 figures as end-to-end and load-state-dependent (spec-dec disclosure
-above). Artifacts: results/LIVE-PARITY-20260830.json (summary; url/argv
+above).
+
+**Update 2026-09-16 — decode is depth-regime-dependent (measured, now attributed):**
+first context-depth receipts on the same hardware show stock unstacked decode falling
+11.5 -> 10.7 -> 8.5 t/s at depth-0 / 8K / 32K (a 26% drop), while the resident
+production stack's live receipts RISE with depth (28.49 t/s @131K, 28.43 t/s @262K —
+n-gram speculative acceptance grows with context). The ~2.4x live-vs-ambient spread
+above is largely this axis (context depth + stack state), now attributed rather than
+merely disclosed. All decode figures carry regime labels (depth-0 / 8K / 32K / 131K /
+262K) going forward.
+
+**Update 2026-09-16 — prefill band correction:** the current salted-protocol band on
+this box is 318-330 / 300-312 / 271-280 t/s at 8/16/32K; the 2026-08-30 figures above
+(215/207/184) understated prefill under the earlier unsalted protocol. Original
+receipts retained verbatim above; this is the correction of record. Artifacts: results/LIVE-PARITY-20260830.json (summary; url/argv
 sanitized) and results/LIVE-PARITY-20260830-rows.jsonl (the run's raw
 rows, unedited).
 
