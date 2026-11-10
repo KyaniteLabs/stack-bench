@@ -23,6 +23,7 @@ import time
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone
+from enum import Enum
 
 TOOL_VERSION = "0.1.1"
 SCHEMA_VERSION = 1
@@ -37,6 +38,128 @@ WORDS = ("the manifold derivative encodes gradient information across layers "
          "sparsity in mixture models activates subsets per token routing decisions").split()
 
 BOUNDS = {"reps": (1, 10), "target": (512, 131072), "n_predict": (1, 2048)}
+
+
+# ---------------------------------------------------------------- lifecycles
+# Every lifecycle in this tool is named here, once. Persisted values (the
+# `sizing` string, the `error` key / `timings_missing` flag on rows, the
+# ambient `sha_equal` tri-state) are unchanged on disk; these types are the
+# single place that writes and reads them.
+class IllegalTransition(RuntimeError):
+    """A state machine was asked to make a move its diagram forbids."""
+
+
+class Sizing(Enum):
+    """How a prompt was sized. Persisted verbatim as rows.jsonl `sizing`.
+
+        TokenizeLatch LIVE --(/tokenize answered, n >= target)--> TOKENIZED
+        TokenizeLatch DEAD --(word count >= target)-------------> WORD_APPROX
+    """
+    TOKENIZED = "tokenized"
+    WORD_APPROX = "word-approx-fallback (token count unknown)"
+
+
+def sizing_of(row):
+    """Tolerant reader for a persisted `sizing` value. Any label starting
+    'word-approx' (current or legacy wording) is the fallback; anything
+    unrecognised or absent is None (unknown), never guessed."""
+    s = row.get("sizing")
+    if not isinstance(s, str):
+        return None
+    if s == Sizing.TOKENIZED.value:
+        return Sizing.TOKENIZED
+    if s.startswith("word-approx"):
+        return Sizing.WORD_APPROX
+    return None
+
+
+class TokenizeLatch:
+    """Run-scoped /tokenize health. One-way latch:
+
+        LIVE --trip()--> DEAD      (DEAD is terminal; trip() on DEAD refused)
+
+    After the first /tokenize failure the WHOLE RUN stops calling /tokenize,
+    so a hung endpoint costs one timeout total. Backed by a plain dict under
+    the legacy key 'tokenize_dead', so a caller passing the old shared-state
+    dict keeps working (and sees the latch flip)."""
+    KEY = "tokenize_dead"
+
+    def __init__(self, store=None):
+        self._store = store if store is not None else {}
+
+    @classmethod
+    def coerce(cls, state):
+        return state if isinstance(state, cls) else cls(state)
+
+    @property
+    def dead(self):
+        return bool(self._store.get(self.KEY))
+
+    def trip(self):
+        if self.dead:
+            raise IllegalTransition("tokenize latch: DEAD -> DEAD (already tripped)")
+        self._store[self.KEY] = True
+
+    def sizing(self):
+        """The Sizing a prompt grown under the latch's current state gets."""
+        return Sizing.WORD_APPROX if self.dead else Sizing.TOKENIZED
+
+
+class RowOutcome(Enum):
+    """Derived outcome of one battery row (persisted as flags, never as this
+    value). Precedence is the diagram: a row is in exactly one state.
+
+        has 'error'               -> ERROR
+        else timings_missing      -> TIMINGS_MISSING
+        else measure keys present -> MEASURED
+        else                      -> NO_THROUGHPUT   (200 + timings, no t/s)
+    """
+    ERROR = "error"
+    TIMINGS_MISSING = "timings_missing"
+    NO_THROUGHPUT = "no_throughput"
+    MEASURED = "measured"
+
+
+MEASURE_KEYS = {"prefill": ("prompt_tps", "prompt_n"),
+                "decode": ("predicted_tps",)}
+
+
+def row_outcome(row, battery):
+    if "error" in row:
+        return RowOutcome.ERROR
+    if row.get("timings_missing"):
+        return RowOutcome.TIMINGS_MISSING
+    if all(row.get(k) is not None for k in MEASURE_KEYS[battery]):
+        return RowOutcome.MEASURED
+    return RowOutcome.NO_THROUGHPUT
+
+
+class AmbientVerdict(Enum):
+    """Verdict of one same-request A/B pair, persisted as `sha_equal`.
+
+        sizing raised / either member errored -> ERROR         (None)
+        both members produced no content      -> INDETERMINATE (None)
+        shas match                            -> EQUAL         (True)
+        otherwise                             -> DIVERGED      (False)
+
+    Errors are never reported as divergence."""
+    ERROR = "error"
+    INDETERMINATE = "indeterminate"
+    EQUAL = "equal"
+    DIVERGED = "diverged"
+
+
+SHA_EQUAL = {AmbientVerdict.ERROR: None, AmbientVerdict.INDETERMINATE: None,
+             AmbientVerdict.EQUAL: True, AmbientVerdict.DIVERGED: False}
+
+
+def ambient_verdict(row_a, row_b):
+    if "error" in row_a or "error" in row_b:
+        return AmbientVerdict.ERROR
+    sa, sb = row_a.get("content_sha"), row_b.get("content_sha")
+    if sa is None and sb is None:
+        return AmbientVerdict.INDETERMINATE
+    return AmbientVerdict.EQUAL if (sa is not None and sa == sb) else AmbientVerdict.DIVERGED
 
 
 # ---------------------------------------------------------------- transport
@@ -103,26 +226,26 @@ def count_tokens(transport, text, timeout):
 
 def grow_prompt(transport, target, seed, timeout, state=None):
     """Grow a seeded word-soup prompt until /tokenize reports >= target
-    tokens. The tokenize-dead latch lives in the shared `state` dict when
-    provided (run scope): after the initial /tokenize failure, the WHOLE RUN
+    tokens. `state` is the run-scoped TokenizeLatch (a legacy dict is
+    accepted and wrapped): after the initial /tokenize failure, the WHOLE RUN
     stops calling /tokenize — a hung endpoint costs one timeout total."""
     import random
     rng = random.Random(seed)
-    state = state if state is not None else {}
-    chunks, text, n = [], "", None
+    latch = TokenizeLatch.coerce(state)
+    chunks, text = [], ""
     while True:
         chunks.append(" ".join(rng.choice(WORDS) for _ in range(120)))
         text = ("Document " + str(seed) + ": " + " ".join(chunks)
                 + "\n\nSummarize this document in one word.")
-        if not state.get("tokenize_dead"):
+        if not latch.dead:
             n = count_tokens(transport, text, timeout)
             if n is not None:
                 if n >= target:
-                    return text, n, "tokenized"
+                    return text, n, latch.sizing().value
                 continue
-            state["tokenize_dead"] = True  # flagged fallback for the run
+            latch.trip()  # flagged fallback for the rest of the run
         if sum(len(c.split()) for c in chunks) >= target:
-            return text, None, "word-approx-fallback (token count unknown)"
+            return text, None, latch.sizing().value
 
 
 def _base_row(battery, **kw):
@@ -217,11 +340,13 @@ def run_ambient(transport, targets, timeouts, state, n_predict_decode=128,
     probes = [("prefill", tgt, 4) for tgt in targets] + [("decode", None, n_predict_decode)]
     for kind, tgt, n_predict in probes:
         seed = (tgt or 0) * 10 + 99
+        label = f"{kind}" + (f"@{tgt}" if tgt else "")
         try:
             prompt, n_est, sizing = grow_prompt(transport, tgt or 2048, seed,
                                                 timeouts["tokenize"], state)
         except Exception as e:
-            pairs.append({"kind": f"{kind}" + (f"@{tgt}" if tgt else ""),
+            pairs.append({"kind": label,
+                          "sha_equal": SHA_EQUAL[AmbientVerdict.ERROR],
                           "error": str(e)[:200]})
             continue
         row_a, _ = _timed_completion(
@@ -233,20 +358,17 @@ def run_ambient(transport, targets, timeouts, state, n_predict_decode=128,
             {"probe": "b", "target_tokens": tgt, "seed": seed,
              "sizing": sizing, "sized_tokens": n_est})
         ambient_rows.extend([row_a, row_b])
-        if "error" in row_a or "error" in row_b:
+        verdict = ambient_verdict(row_a, row_b)
+        if verdict is AmbientVerdict.ERROR:
             err = row_a.get("error") or row_b.get("error")
-            pairs.append({"kind": f"{kind}" + (f"@{tgt}" if tgt else ""),
-                          "sha_equal": None, "error": err})
+            pairs.append({"kind": label,
+                          "sha_equal": SHA_EQUAL[verdict], "error": err})
             continue
         tps_key = "prompt_tps" if kind == "prefill" else "predicted_tps"
         ta, tb = row_a.get(tps_key), row_b.get(tps_key)
         pairs.append({
-            "kind": f"{kind}" + (f"@{tgt}" if tgt else ""),
-            "sha_equal": (None if (row_a.get("content_sha") is None
-                                   and row_b.get("content_sha") is None)
-                          else (row_a.get("content_sha") is not None
-                                and row_a.get("content_sha")
-                                == row_b.get("content_sha"))),
+            "kind": label,
+            "sha_equal": SHA_EQUAL[verdict],
             f"{tps_key}_a": ta, f"{tps_key}_b": tb,
             "tps_delta": round(abs((ta or 0) - (tb or 0)), 1)
                          if ta is not None and tb is not None else None,
@@ -261,24 +383,30 @@ def bucket_of(n):
     return ((n + 4000) // 8000) * 8000
 
 
-def summarize_prefill(rows):
-    by_bucket, errors, missing, fallback = {}, 0, 0, 0
+def _outcome_counts(rows, battery):
+    """Shared by both summarizers so their counters cannot disagree.
+    word_approx_rows counts every fallback-sized row, independent of its
+    outcome: sizing and outcome are orthogonal and can co-occur."""
+    counts = {o: 0 for o in RowOutcome}
     for r in rows:
-        if "error" in r:
-            errors += 1
-            continue
-        if str(r.get("sizing", "")).startswith("word-approx"):
-            fallback += 1  # count before the timings-missing skip — both
-            # flags can co-occur; the counter must not depend on order
-        if r.get("timings_missing"):
-            missing += 1
-            continue
-        if r.get("prompt_tps") is not None and r.get("prompt_n") is not None:
+        counts[row_outcome(r, battery)] += 1
+    return {
+        "rows": len(rows),
+        "errors": counts[RowOutcome.ERROR],
+        "timings_missing_rows": counts[RowOutcome.TIMINGS_MISSING],
+        "word_approx_rows": sum(1 for r in rows
+                                if sizing_of(r) is Sizing.WORD_APPROX),
+    }
+
+
+def summarize_prefill(rows):
+    by_bucket = {}
+    for r in rows:
+        if row_outcome(r, "prefill") is RowOutcome.MEASURED:
             by_bucket.setdefault(str(bucket_of(r["prompt_n"])), []).append(
                 r["prompt_tps"])
     return {
-        "rows": len(rows), "errors": errors,
-        "timings_missing_rows": missing, "word_approx_rows": fallback,
+        **_outcome_counts(rows, "prefill"),
         "by_measured_prompt_n": {
             k: {"mean_tps": round(sum(v) / len(v), 1), "min": min(v),
                 "max": max(v), "n": len(v)}
@@ -288,14 +416,9 @@ def summarize_prefill(rows):
 
 def summarize_decode(rows):
     tps = [r["predicted_tps"] for r in rows
-           if "error" not in r and not r.get("timings_missing")
-           and r.get("predicted_tps") is not None]
+           if row_outcome(r, "decode") is RowOutcome.MEASURED]
     return {
-        "rows": len(rows),
-        "errors": sum(1 for r in rows if "error" in r),
-        "timings_missing_rows": sum(1 for r in rows if r.get("timings_missing")),
-        "word_approx_rows": sum(1 for r in rows
-                                if str(r.get("sizing", "")).startswith("word-approx")),
+        **_outcome_counts(rows, "decode"),
         "early_eos_rows": sum(1 for r in rows if r.get("early_eos")),
         "decode_tps": ({"mean_tps": round(sum(tps) / len(tps), 1),
                         "min": min(tps), "max": max(tps), "n": len(tps)}
@@ -349,7 +472,7 @@ def out_dir_for(base, name):
 def run_all(url, name, targets, reps, out_base, timeouts, transport=None,
             n_predict_decode=128, decode_ctx=2048, log=print):
     transport = transport or UrllibTransport(url)
-    sizing_state = {}
+    sizing_state = TokenizeLatch()
     out = out_dir_for(out_base, name)
     t0 = time.time()
     env = {
@@ -410,6 +533,7 @@ class MockHandlerConfig:
         self.server_ignores_ignore_eos = False  # M1: make early_eos testable
         self.vary_content = False       # ambient A/B demonstration: flip sha
         self.slow_tokenize_s = 0.0      # M3: hung-endpoint simulation
+        self._calls = 0                 # /completion call counter (1-based)
 
 
 def make_mock_server(config):
@@ -459,7 +583,7 @@ def make_mock_server(config):
                                           for i in range(n)]
                 self._send(200, out)
             elif self.path == "/completion":
-                cfg._calls = getattr(cfg, "_calls", 0) + 1  # first — knobs read it
+                cfg._calls += 1  # first — knobs read it
                 if cfg.completion_500_next > 0:
                     cfg.completion_500_next -= 1
                     self._send(500, {"error": {"code": 500,
