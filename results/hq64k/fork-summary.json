@@ -5,7 +5,7 @@
   "url": "http://127.0.0.1:46415",
   "date": "2026-08-31T02:22:34Z",
   "argv": [
-   "/home/simon/exp/lab1/stack_bench.py",
+   "~/exp/lab1/stack_bench.py",
    "--url",
    "http://127.0.0.1:46415",
    "--name",
@@ -15,7 +15,7 @@
    "--reps",
    "2",
    "--out",
-   "/home/simon/exp/lab1/hq64k",
+   "~/exp/lab1/hq64k",
    "--timeout-completion",
    "3600"
   ],
@@ -23,7 +23,7 @@
   "python_version": "3.12.3"
  },
  "server": {
-  "model_path": "/home/simon/.cache/huggingface/hub/models--unsloth--Qwen3.8-27B-GGUF/snapshots/fdd03b8bbd279c1694563650e79d85a2373d9934/Qwen3.8-27B-UD-Q4_K_XL.gguf",
+  "model_path": "~/.cache/huggingface/hub/models--unsloth--Qwen3.8-27B-GGUF/snapshots/fdd03b8bbd279c1694563650e79d85a2373d9934/Qwen3.8-27B-UD-Q4_K_XL.gguf",
   "spec_dec": "NOT EXPOSED by this server build \u2014 decode t/s is END-TO-END (speculative-decoding gains included if the server runs a draft model; not isolated)",
   "n_ctx": null,
   "n_batch": null,
