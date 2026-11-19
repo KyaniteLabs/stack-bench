@@ -469,6 +469,39 @@ def out_dir_for(base, name):
             d = os.path.join(base, f"{ts}-{safe}-{suffix}")
 
 
+def _is_api_key_flag(arg):
+    """True for every argparse spelling of the --api-key flag: the exact
+    form, the --api-key=value form, and unambiguous prefix abbreviations
+    argparse accepts (e.g. --api)."""
+    if not arg.startswith("--") or arg == "--":
+        return False
+    name = arg.split("=", 1)[0]
+    return "--api-key".startswith(name)
+
+
+def _redact_argv(argv):
+    """Copy of argv with the --api-key VALUE replaced by *** (flag kept).
+
+    summary.json's env.argv is an audit record of the command shape; the
+    credential itself must not persist into artifacts."""
+    redacted = []
+    i = 0
+    while i < len(argv):
+        arg = argv[i]
+        if _is_api_key_flag(arg):
+            if "=" in arg:
+                redacted.append(arg.split("=", 1)[0] + "=***")
+            else:
+                redacted.append(arg)
+                if i + 1 < len(argv):
+                    redacted.append("***")
+                    i += 1
+        else:
+            redacted.append(arg)
+        i += 1
+    return redacted
+
+
 def run_all(url, name, targets, reps, out_base, timeouts, transport=None,
             n_predict_decode=128, decode_ctx=2048, log=print):
     transport = transport or UrllibTransport(url)
@@ -476,7 +509,7 @@ def run_all(url, name, targets, reps, out_base, timeouts, transport=None,
     out = out_dir_for(out_base, name)
     t0 = time.time()
     env = {
-        "url": url, "date": _utcnow(), "argv": sys.argv,
+        "url": url, "date": _utcnow(), "argv": _redact_argv(sys.argv),
         "tool_version": TOOL_VERSION,
         "python_version": platform.python_version(),
     }

@@ -11,7 +11,7 @@ license: MIT
 compatibility: llama-server / any OpenAI-completion-compatible endpoint with /tokenize
 measures: prefill_tps, decode_tps, ambient_noise, spec_dec_state
 output: JSON (summary + rows.jsonl)
-tests: 19, offline, no network required
+tests: 38, offline, no network required
 -->
 
 
@@ -157,7 +157,8 @@ rows, unedited).
 python3 -m unittest discover tests
 ```
 
-19 tests, all offline (mock server; no network, no model needed).
+38 tests, all offline (mock server; no network, no model needed) —
+19 e2e, 17 state-machine, 2 argv-redaction.
 
 ## License
 
