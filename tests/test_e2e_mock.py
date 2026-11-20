@@ -6,8 +6,9 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from stack_bench import (MockHandlerConfig, UrllibTransport, bucket_of,
-                         grow_prompt, make_mock_server, run_all, main)
+from stack_bench import (MockHandlerConfig, UrllibTransport, _redact_argv,
+                         bucket_of, grow_prompt, make_mock_server, run_all,
+                         main)
 
 
 def with_mock(fn):
@@ -281,6 +282,51 @@ class TestCliBounds(unittest.TestCase):
 
     def test_selftest_cli(self):
         self.assertEqual(main(["--selftest"]), 0)
+
+
+class TestArgvRedaction(unittest.TestCase):
+    SECRET = "sk-test-DO-NOT-SHIP-0123456789"
+
+    def test_redact_forms(self):
+        cases = [
+            (["stack_bench.py", "--url", "http://x", "--api-key", self.SECRET,
+              "--reps", "2"],
+             ["stack_bench.py", "--url", "http://x", "--api-key", "***",
+              "--reps", "2"]),
+            (["stack_bench.py", "--api-key=" + self.SECRET, "--profile",
+              "quick"],
+             ["stack_bench.py", "--api-key=***", "--profile", "quick"]),
+            (["stack_bench.py", "--api", self.SECRET],  # argparse abbreviation
+             ["stack_bench.py", "--api", "***"]),
+        ]
+        for argv, expected in cases:
+            self.assertEqual(_redact_argv(argv), expected, argv)
+        # untouched when no api-key is present
+        plain = ["stack_bench.py", "--url", "http://x"]
+        self.assertEqual(_redact_argv(plain), plain)
+
+    @with_mock
+    def test_api_key_not_persisted_in_artifacts(self, cfg, url, port):
+        backup = sys.argv
+        sys.argv = ["stack_bench.py", "--url", url, "--api-key", self.SECRET]
+        try:
+            summary, out, rc = run_all(
+                url, "redact-e2e", targets=[8000], reps=1,
+                out_base="/tmp/sb-test-out",
+                timeouts={"tokenize": 10, "completion": 10},
+                transport=UrllibTransport(url, self.SECRET),
+                log=lambda *a: None)
+        finally:
+            sys.argv = backup
+        with open(os.path.join(out, "summary.json")) as f:
+            summary_blob = f.read()
+        with open(os.path.join(out, "rows.jsonl")) as f:
+            rows_blob = f.read()
+        self.assertNotIn(self.SECRET, summary_blob)
+        self.assertNotIn(self.SECRET, rows_blob)
+        argv = summary["env"]["argv"]
+        self.assertIn("--api-key", argv)
+        self.assertEqual(argv[argv.index("--api-key") + 1], "***")
 
 
 if __name__ == "__main__":
