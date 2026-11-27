@@ -25,7 +25,7 @@ import urllib.request
 from datetime import datetime, timezone
 from enum import Enum
 
-TOOL_VERSION = "0.1.1"
+TOOL_VERSION = "0.1.2"
 SCHEMA_VERSION = 1
 
 WORDS = ("the manifold derivative encodes gradient information across layers "
@@ -214,37 +214,86 @@ def _maybe_json(body):
 
 # ---------------------------------------------------------------- batteries
 def count_tokens(transport, text, timeout):
+    """True token count from /tokenize, or None when the answer is not a
+    usable token count.
+
+    A 200 whose JSON carries no real `tokens` list (missing key, null, empty
+    list, wrong type) is a FAILED tokenize, not a count of 0: 0 is treated as
+    real growth data by grow_prompt and the prompt would grow forever."""
     r = transport.post("/tokenize", {"content": text}, timeout)
     if r["ok"] and isinstance(r["json"], dict):
         # defensive across /tokenize shape variants (old: tokens only;
         # current: tokens + pieces + bpe_offsets)
-        toks = r["json"].get("tokens") or []
-        if isinstance(toks, list):
+        toks = r["json"].get("tokens")
+        if isinstance(toks, list) and toks:
             return len(toks)
     return None
 
 
-def grow_prompt(transport, target, seed, timeout, state=None):
+GROWTH_CHUNK_WORDS = 120
+
+
+class GrowthBoundExceeded(RuntimeError):
+    """grow_prompt exhausted its bounded iteration budget without reaching
+    the target. Raised instead of looping forever; run_all turns it into a
+    loud hard failure (exit 1), never a partial run reported as success."""
+
+
+def growth_iteration_budget(target):
+    """Hard ceiling on growth iterations for one prompt.
+
+    A working /tokenize turns each appended word into at least one token, so a
+    prompt reaches any target within ceil(target / GROWTH_CHUNK_WORDS)
+    iterations; 4x that (plus a 64-iteration floor for tiny targets) is slack
+    no legitimate growth needs. The ceiling only trips when the server's
+    answers cannot grow the prompt to the target -- then the run fails loudly
+    instead of appending words forever."""
+    return 4 * -(-target // GROWTH_CHUNK_WORDS) + 64
+
+
+def _bound_error(exc):
+    """Row/pair error for a growth-bound hit, marked so run_all can make the
+    whole run a hard failure (never a partial run reported as success)."""
+    return {"transport_error": str(exc)[:200], "growth_bound": True}
+
+
+def grow_prompt(transport, target, seed, timeout, state=None, max_iters=None):
     """Grow a seeded word-soup prompt until /tokenize reports >= target
     tokens. `state` is the run-scoped TokenizeLatch (a legacy dict is
     accepted and wrapped): after the initial /tokenize failure, the WHOLE RUN
-    stops calling /tokenize — a hung endpoint costs one timeout total."""
+    stops calling /tokenize — a hung endpoint costs one timeout total.
+
+    Growth is bounded (growth_iteration_budget): if the target is not reached
+    within the budget, GrowthBoundExceeded is raised and the run fails loudly
+    instead of looping forever."""
     import random
     rng = random.Random(seed)
     latch = TokenizeLatch.coerce(state)
-    chunks, text = [], ""
+    budget = growth_iteration_budget(target) if max_iters is None else max_iters
+    chunks, text, words = [], "", 0
+    last_n = None
+    iters = 0
     while True:
-        chunks.append(" ".join(rng.choice(WORDS) for _ in range(120)))
+        if iters >= budget:
+            raise GrowthBoundExceeded(
+                f"prompt growth did not reach {target} tokens within "
+                f"{budget} iterations (last /tokenize count: {last_n!r}); "
+                f"server /tokenize is not growing the prompt toward the target")
+        iters += 1
+        chunks.append(" ".join(rng.choice(WORDS)
+                               for _ in range(GROWTH_CHUNK_WORDS)))
+        words += GROWTH_CHUNK_WORDS
         text = ("Document " + str(seed) + ": " + " ".join(chunks)
                 + "\n\nSummarize this document in one word.")
         if not latch.dead:
             n = count_tokens(transport, text, timeout)
             if n is not None:
+                last_n = n
                 if n >= target:
                     return text, n, latch.sizing().value
                 continue
             latch.trip()  # flagged fallback for the rest of the run
-        if sum(len(c.split()) for c in chunks) >= target:
+        if words >= target:
             return text, None, latch.sizing().value
 
 
@@ -296,6 +345,10 @@ def run_prefill(transport, targets, reps, timeouts, state, log=print):
             try:
                 prompt, n_est, sizing = grow_prompt(transport, tgt, seed,
                                                     timeouts["tokenize"], state)
+            except GrowthBoundExceeded as e:
+                rows.append(_base_row("prefill", target_tokens=tgt, rep=rep,
+                                      seed=seed, error=_bound_error(e)))
+                continue
             except Exception as e:
                 rows.append(_base_row("prefill", target_tokens=tgt, rep=rep,
                                       seed=seed,
@@ -317,6 +370,8 @@ def run_decode(transport, target_tokens, reps, timeouts, state,
     try:
         prompt, n_est, sizing = grow_prompt(transport, target_tokens, 999,
                                             timeouts["tokenize"], state)
+    except GrowthBoundExceeded as e:
+        return [_base_row("decode", error=_bound_error(e))]
     except Exception as e:
         return [_base_row("decode", error={"transport_error": str(e)[:200]})]
     for rep in range(reps):
@@ -344,6 +399,11 @@ def run_ambient(transport, targets, timeouts, state, n_predict_decode=128,
         try:
             prompt, n_est, sizing = grow_prompt(transport, tgt or 2048, seed,
                                                 timeouts["tokenize"], state)
+        except GrowthBoundExceeded as e:
+            pairs.append({"kind": label,
+                          "sha_equal": SHA_EQUAL[AmbientVerdict.ERROR],
+                          "growth_bound": True, "error": str(e)[:200]})
+            continue
         except Exception as e:
             pairs.append({"kind": label,
                           "sha_equal": SHA_EQUAL[AmbientVerdict.ERROR],
@@ -502,6 +562,15 @@ def _redact_argv(argv):
     return redacted
 
 
+def _growth_bound_hit(rows=(), pairs=()):
+    """True when any battery hit grow_prompt's iteration ceiling."""
+    for r in rows:
+        e = r.get("error")
+        if isinstance(e, dict) and e.get("growth_bound"):
+            return True
+    return any(p.get("growth_bound") for p in pairs)
+
+
 def run_all(url, name, targets, reps, out_base, timeouts, transport=None,
             n_predict_decode=128, decode_ctx=2048, log=print):
     transport = transport or UrllibTransport(url)
@@ -542,11 +611,20 @@ def run_all(url, name, targets, reps, out_base, timeouts, transport=None,
         for r in prefill_rows + decode_rows + ambient_rows:
             f.write(json.dumps(r) + "\n")
     # hard failure = ALL requests of ANY battery failed, OR a battery produced
-    # ZERO usable measurements (a 200-with-garbage server must not exit 0)
-    hard = (summary["prefill"]["errors"] >= max(1, len(prefill_rows))
+    # ZERO usable measurements (a 200-with-garbage server must not exit 0), OR
+    # prompt growth hit its iteration ceiling somewhere in the run (a bound
+    # hit means a target was never measured -- partial data is not success)
+    bound_hit = _growth_bound_hit(prefill_rows + decode_rows, ambient_pairs)
+    hard = (bound_hit
+            or summary["prefill"]["errors"] >= max(1, len(prefill_rows))
             or summary["decode"]["errors"] >= max(1, len(decode_rows))
             or not summary["prefill"]["by_measured_prompt_n"]
             or summary["decode"]["decode_tps"] is None)
+    if bound_hit:
+        print("FATAL: prompt growth hit its iteration bound -- the target was "
+              "not reached, so this run is incomplete and exits 1 "
+              "(no partial measurement is reported as success)",
+              file=sys.stderr)
     log(json.dumps({"out": out, "buckets": summary["prefill"]["by_measured_prompt_n"],
                     "decode": summary["decode"]["decode_tps"]}))
     return summary, out, (1 if hard else 0)
