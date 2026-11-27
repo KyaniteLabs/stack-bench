@@ -1,14 +1,18 @@
 """stack-bench test suite — unit + e2e mock, all offline."""
+import contextlib
+import io
 import json
 import os
 import sys
+import time
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from stack_bench import (MockHandlerConfig, UrllibTransport, _redact_argv,
-                         bucket_of, grow_prompt, make_mock_server, run_all,
-                         main)
+from stack_bench import (GrowthBoundExceeded, MockHandlerConfig, Transport,
+                         UrllibTransport, _redact_argv, bucket_of, count_tokens,
+                         grow_prompt, growth_iteration_budget, main,
+                         make_mock_server, run_all)
 
 
 def with_mock(fn):
@@ -258,6 +262,221 @@ class TestE2E(unittest.TestCase):
             self.assertEqual(summary["prefill"]["timings_missing_rows"], 1)
         finally:
             srv.shutdown()
+
+
+class _CountingTransport(UrllibTransport):
+    """Real urllib transport that counts /tokenize calls and refuses more than
+    `cap`: a runaway growth loop fails the test fast and explicitly instead
+    of hanging the suite."""
+
+    def __init__(self, url, cap=2):
+        super().__init__(url)
+        self.cap = cap
+        self.tokenize_calls = 0
+
+    def post(self, path, payload, timeout):
+        if path == "/tokenize":
+            self.tokenize_calls += 1
+            if self.tokenize_calls > self.cap:
+                raise AssertionError(
+                    f"/tokenize called more than {self.cap} times without the "
+                    f"run falling back: prompt growth is looping")
+        return super().post(path, payload, timeout)
+
+
+def shape_server(tokenize_body, completion_body=b'{"not_a_benchmark": true}'):
+    """Loopback server answering every POST with HTTP 200. Each body is bytes
+    or a callable(payload) -> bytes. Returns (server, url)."""
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    def body_for(spec, payload):
+        return spec(payload) if callable(spec) else spec
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def do_GET(self):
+            self.send_response(404)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+        def do_POST(self):
+            raw = self.rfile.read(int(self.headers.get("Content-Length") or 0))
+            payload = {}
+            try:
+                payload = json.loads(raw or b"{}")
+            except ValueError:
+                pass
+            if self.path == "/tokenize":
+                body = body_for(tokenize_body, payload)
+            else:
+                body = body_for(completion_body, payload)
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv, f"http://127.0.0.1:{srv.server_address[1]}"
+
+
+class TestTokenizeShapes(unittest.TestCase):
+    """t_bc35a990: a 200 with valid JSON but no real token list is a FAILED
+    /tokenize (None), never a count of 0 -- 0 is treated as growth data."""
+
+    class Stub(Transport):
+        def __init__(self, response):
+            self.response = response
+
+        def post(self, path, payload, timeout):
+            return self.response
+
+    @staticmethod
+    def _resp(js, ok=True, status=200):
+        return {"ok": ok, "status": status, "json": js, "body": ""}
+
+    def test_shape_table(self):
+        cases = [
+            (self._resp({"not_a_benchmark": True}), None),
+            (self._resp({"tokens": None}), None),
+            (self._resp({"tokens": []}), None),
+            (self._resp({"tokens": "abc"}), None),
+            (self._resp({"tokens": [1, 2]}), 2),
+            (self._resp({"tokens": [0] * 7, "pieces": ["x"] * 7}), 7),
+            (self._resp(None), None),                        # non-JSON body
+            (self._resp({"tokens": [1, 2]}, ok=False, status=500), None),
+        ]
+        for response, want in cases:
+            self.assertIs(count_tokens(self.Stub(response), "text", 1), want,
+                          response)
+
+
+class TestValidJson200WithoutTokens(unittest.TestCase):
+    """t_bc35a990 regression: a /tokenize 200 whose JSON has no usable
+    `tokens` list must terminate and exit 1 with a BOUNDED /tokenize call
+    count. Before the fix the growth loop called /tokenize forever."""
+
+    def _run(self, payload):
+        srv, url = shape_server(json.dumps(payload).encode())
+        transport = _CountingTransport(url)
+        t0 = time.time()
+        try:
+            summary, out, rc = run_all(
+                url, "shape", targets=[8000], reps=1,
+                out_base="/tmp/sb-test-out",
+                timeouts={"tokenize": 5, "completion": 5},
+                transport=transport, log=lambda *a: None)
+        finally:
+            srv.shutdown()
+            srv.server_close()
+        return summary, rc, transport.tokenize_calls, time.time() - t0
+
+    def test_missing_tokens_key_terminates_exit_1(self):
+        summary, rc, calls, elapsed = self._run({"not_a_benchmark": True})
+        self.assertEqual(rc, 1)
+        self.assertEqual(calls, 1)          # latch: one failed tokenize total
+        self.assertLess(elapsed, 20)
+        self.assertEqual(summary["prefill"]["by_measured_prompt_n"], {})
+        self.assertEqual(summary["prefill"]["word_approx_rows"], 1)
+        self.assertIsNone(summary["decode"]["decode_tps"])
+
+    def test_null_tokens_terminates_exit_1(self):
+        summary, rc, calls, elapsed = self._run({"tokens": None})
+        self.assertEqual(rc, 1)
+        self.assertEqual(calls, 1)
+        self.assertLess(elapsed, 20)
+        self.assertEqual(summary["prefill"]["by_measured_prompt_n"], {})
+        self.assertEqual(summary["prefill"]["word_approx_rows"], 1)
+
+    def test_empty_tokens_terminates_exit_1(self):
+        summary, rc, calls, elapsed = self._run({"tokens": []})
+        self.assertEqual(rc, 1)
+        self.assertEqual(calls, 1)
+        self.assertLess(elapsed, 20)
+
+
+class TestGrowthBound(unittest.TestCase):
+    """Growth has a finite iteration budget; hitting it is a loud hard
+    failure, never an infinite loop or a partial success."""
+
+    class ConstantCount(Transport):
+        """Always reports the same small token count: growth can never reach
+        the target."""
+
+        def __init__(self, n=100):
+            self.n, self.calls = n, 0
+
+        def post(self, path, payload, timeout):
+            self.calls += 1
+            return {"ok": True, "status": 200,
+                    "json": {"tokens": [0] * self.n}, "body": ""}
+
+    def test_budget_finite_and_generous(self):
+        self.assertEqual(growth_iteration_budget(800), 4 * 7 + 64)
+        # the largest allowed target still fits at one token per appended word
+        self.assertGreaterEqual(growth_iteration_budget(131072),
+                                131072 // 120)
+
+    def test_grow_prompt_raises_at_the_bound(self):
+        t = self.ConstantCount()
+        with self.assertRaises(GrowthBoundExceeded) as cm:
+            grow_prompt(t, 800, 1, 1)
+        self.assertEqual(t.calls, growth_iteration_budget(800))
+        self.assertIn("800 tokens", str(cm.exception))
+        self.assertIn("last /tokenize count: 100", str(cm.exception))
+
+    def test_partial_run_is_a_hard_failure(self):
+        """One target measures, another hits the ceiling: the run must exit 1
+        and say so, not report the measured target as success."""
+
+        def tok(payload):
+            n = min(-(-len(payload.get("content") or "") // 3), 1000)
+            return json.dumps({"tokens": [0] * n}).encode()
+
+        def comp(payload):
+            n = min(-(-len(payload.get("prompt") or "") // 3), 1000)
+            return json.dumps({
+                "content": "ok", "stop_type": "length",
+                "timings": {"prompt_n": n, "prompt_ms": n * 3.0,
+                            "prompt_per_second": n / (n * 3.0 / 1000.0),
+                            "predicted_n": 4, "predicted_ms": 96.0,
+                            "predicted_per_second": 4 / 0.096,
+                            "tokens_cached": 0}}).encode()
+
+        srv, url = shape_server(tok, comp)
+        err = io.StringIO()
+        try:
+            with contextlib.redirect_stderr(err):
+                summary, out, rc = run_all(
+                    url, "bound", targets=[800, 8000], reps=1,
+                    out_base="/tmp/sb-test-out",
+                    timeouts={"tokenize": 5, "completion": 5},
+                    transport=UrllibTransport(url), decode_ctx=800,
+                    log=lambda *a: None)
+        finally:
+            srv.shutdown()
+            srv.server_close()
+        # a real measurement DID happen for the 800 target ...
+        self.assertTrue(summary["prefill"]["by_measured_prompt_n"])
+        self.assertIsNotNone(summary["decode"]["decode_tps"])
+        # ... but the 8000 target never grew: the run must still exit 1
+        self.assertEqual(rc, 1)
+        rows = [json.loads(l) for l in open(os.path.join(out, "rows.jsonl"))]
+        bound_rows = [r for r in rows
+                      if (r.get("error") or {}).get("growth_bound")]
+        self.assertEqual(len(bound_rows), 1)
+        self.assertIn("8000", bound_rows[0]["error"]["transport_error"])
+        pair = [p for p in summary["ambient"]["pairs"]
+                if p["kind"] == "prefill@8000"][0]
+        self.assertTrue(pair.get("growth_bound"))
+        # and the run says so loudly
+        self.assertIn("FATAL", err.getvalue())
+        self.assertIn("growth", err.getvalue())
+
 
 class TestCliBounds(unittest.TestCase):
     def test_reps_rejected(self):

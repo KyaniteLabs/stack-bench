@@ -4,14 +4,14 @@
 
 <!-- Agent metadata
 tool: stack-bench
-version: 0.1.1
+version: 0.1.2
 language: python
 dependencies: none (stdlib only)
 license: MIT
 compatibility: llama-server / any OpenAI-completion-compatible endpoint with /tokenize
 measures: prefill_tps, decode_tps, ambient_noise, spec_dec_state
 output: JSON (summary + rows.jsonl)
-tests: 38, offline, no network required
+tests: 45, offline, no network required
 -->
 
 
@@ -76,14 +76,16 @@ the comparison direct); raw per-request evidence is in `rows.jsonl`.
 Any llama-server-compatible endpoint exposing `/tokenize` + `/completion`
 (timing fields in responses); `/props` is captured when present and
 gracefully absent otherwise. Without `/tokenize`, the tool falls back to
-flagged word-approximation sizing.
+flagged word-approximation sizing; a `/tokenize` that answers 2xx without a
+usable `tokens` list is treated the same way, never as a zero-token prompt.
 
 ## Exit codes
 
 0 = clean run / 1 = hard failure (every request of the prefill or decode
-battery failed, or a
+battery failed, a
 battery produced zero usable measurements - a server returning 200 with
-garbage exits 1, never 0-with-empty-summary) - 2 = usage error (bad
+garbage exits 1, never 0-with-empty-summary - or prompt growth hit its
+iteration ceiling, below) - 2 = usage error (bad
 --reps/--targets/--n-predict).
 
 ## Timeouts
@@ -94,6 +96,22 @@ time. A hung endpoint costs one tokenize timeout per run at most: after
 an initial `/tokenize` failure, prompt growth stops calling `/tokenize` and
 falls through to the flagged word-approx mode instead of retrying into the
 hang.
+
+Prompt growth is additionally bounded, so an endpoint that answers fast but
+uselessly cannot keep a run alive forever:
+
+- A `/tokenize` answer that is HTTP 2xx but carries no real token list (no
+  `tokens` key, `"tokens": null`, `"tokens": []`, or a non-list) counts as a
+  FAILED tokenize, not as a count of 0. It trips the same one-way latch as a
+  timeout, so the run falls back once and never grows against that answer.
+- Growth itself has a hard iteration ceiling:
+  `4 × ceil(target / 120) + 64` iterations per prompt (the 120 is the words
+  appended per iteration). A working tokenizer needs at most
+  `ceil(target / 120)` iterations, so no legitimate large-prompt growth can
+  hit the ceiling — only a server whose token counts cannot reach the target.
+  When the ceiling is hit, the affected rows carry a `growth_bound` error, the
+  CLI prints a `FATAL:` line on stderr, and the run exits 1: a partial run is
+  never reported as success.
 
 ## Sample output
 
@@ -157,8 +175,8 @@ rows, unedited).
 python3 -m unittest discover tests
 ```
 
-38 tests, all offline (mock server; no network, no model needed) —
-19 e2e, 17 state-machine, 2 argv-redaction.
+45 tests, all offline (mock server; no network, no model needed) —
+26 e2e, 17 state-machine, 2 argv-redaction.
 
 ## License
 
